@@ -33,9 +33,6 @@ WIND_COLUMNS = ['site_id', 'time_utc', 'height_m', 'speed_mps', 'direction_deg',
 ERA_VARIABLES = ['10m_u_component_of_wind', '10m_v_component_of_wind',
                  '100m_u_component_of_wind', '100m_v_component_of_wind']
 ERA_COLUMNS = ['u10_mps', 'v10_mps', 'u100_mps', 'v100_mps']
-METADATA_COLUMNS = ['site_id', 'latitude_deg', 'longitude_deg', 'ground_elevation_m',
-                    'measurement_height_m', 'source', 'data_kind', 'timestamp_convention',
-                    'station_history', 'era5_grid_latitude', 'era5_grid_longitude']
 
 
 def save_json(path, obj):
@@ -164,7 +161,7 @@ def html_text(html):
 
 
 def load_metadata(root, sites=SITES):
-    """Use archive location evidence. Current height evidence is not a historical height."""
+    """Use archive locations; assume current 3 m height throughout the study."""
     rows = []
     for site in sites:
         text = html_text((Path(root) / 'sources' / f'{site}_archive.html').read_text(encoding='utf-8', errors='replace'))
@@ -180,12 +177,12 @@ def load_metadata(root, sites=SITES):
         rows.append(dict(site_id=site, latitude_deg=float(coords[1]) if coords else np.nan,
                          longitude_deg=float(coords[2]) if coords else np.nan,
                          ground_elevation_m=float(elevation[1]) if elevation else np.nan,
-                         measurement_height_m=np.nan, source=ARCHIVES[site], data_kind='AZMet hourly summary',
+                         measurement_height_m=3.0, source=ARCHIVES[site], data_kind='AZMet hourly summary',
                          timestamp_convention='time_utc = end of preceding hour; original hours 1..24, MST UTC-07',
                          station_history=history, era5_grid_latitude=np.nan, era5_grid_longitude=np.nan,
                          current_documented_height_m=float(height[1]) if height else np.nan,
                          height_source=f'https://azmet.arizona.edu/about/station-metadata/{site}',
-                         height_status='unknown for 2005-2019; current page has no dated sensor history',
+                         height_status='assumed 3 m throughout 2005-2019 based on current height',
                          location_status='archive-published location; historical precision/changes not fully verified',
                          instrument_history_status='unknown'))
     return pd.DataFrame(rows)
@@ -340,25 +337,6 @@ def coverage_report(wind, sites=SITES, start=START, end=END):
     return station, yearly, monthly
 
 
-def select_common_period(monthly, selection_sites, minimum_speed_coverage=0.9):
-    """Longest contiguous run of months passing at every selection site; no data filling."""
-    view = monthly.loc[monthly.site_id.isin(selection_sites)].copy()
-    view['period'] = pd.PeriodIndex.from_fields(year=view.year, month=view.month, freq='M')
-    counts = view.groupby('period').agg(n=('site_id', 'nunique'), worst=('speed_coverage', 'min'))
-    good = counts.index[(counts.n == len(selection_sites)) & (counts.worst >= minimum_speed_coverage)]
-    if not len(good):
-        return None
-    runs, current = [], []
-    for period in good:
-        if current and period.ordinal != current[-1].ordinal + 1:
-            runs.append(current)
-            current = []
-        current.append(period)
-    runs.append(current)
-    best = max(runs, key=len)
-    return best[0].start_time.date().isoformat(), best[-1].end_time.date().isoformat()
-
-
 def era5_request(latitude, longitude, start=START, end=END):
     # Include UTC next-day hours needed by the last AZMet local observation day.
     utc_end = expected_hours(start, end)[-1].date().isoformat()
@@ -458,49 +436,6 @@ def load_era5(path, site_id):
     return table[['site_id', 'time_utc', *ERA_COLUMNS, 'era5_grid_latitude', 'era5_grid_longitude']], inspection
 
 
-def construct_pairs(reference_wind, era5, metadata, reference_site, target_sites, start, end):
-    """Inputs use ONLY reference observations; target labels are attached separately."""
-    if reference_site in target_sites or not set(reference_wind.site_id).issubset({reference_site}):
-        raise ValueError('Pass reference observations only; reference cannot also be a target')
-    times = expected_hours(start, end)
-    ref = reference_wind.set_index('time_utc').reindex(times)
-    angle = np.deg2rad(ref.direction_deg.where(ref.direction_valid.fillna(False)))
-    base = pd.DataFrame({'time_utc': times, 'reference_speed_mps': ref.speed_mps.where(ref.speed_valid.fillna(False)).to_numpy(),
-                         'reference_direction_sin': np.sin(angle).to_numpy(),
-                         'reference_direction_cos': np.cos(angle).to_numpy()})
-    local = pd.Series(times.tz_convert(TZ)) - pd.Timedelta(minutes=30)  # interval midpoint
-    hour_phase = 2 * np.pi * (local.dt.hour + local.dt.minute / 60) / 24
-    doy_phase = 2 * np.pi * ((local.dt.dayofyear - 1) + (local.dt.hour + local.dt.minute / 60) / 24) / np.where(local.dt.is_leap_year, 366, 365)
-    for name, phase in [('local_hour', hour_phase), ('local_doy', doy_phase)]:
-        base[name + '_sin'], base[name + '_cos'] = np.sin(phase).to_numpy(), np.cos(phase).to_numpy()
-    er = era5.loc[era5.site_id.eq(reference_site), ['time_utc', *ERA_COLUMNS]].rename(columns={c: 'reference_' + c for c in ERA_COLUMNS})
-    base = base.merge(er, on='time_utc', how='left', validate='one_to_one')
-    meta = metadata.set_index('site_id')
-    frames = []
-    for target in target_sites:
-        et = era5.loc[era5.site_id.eq(target), ['time_utc', *ERA_COLUMNS]].rename(columns={c: 'target_' + c for c in ERA_COLUMNS})
-        task = base.merge(et, on='time_utc', how='left', validate='one_to_one')
-        task['target_site_id'], task['reference_site_id'] = target, reference_site
-        for prefix, site in [('target_', target), ('reference_', reference_site)]:
-            for column in ['latitude_deg', 'longitude_deg', 'ground_elevation_m', 'measurement_height_m']:
-                task[prefix + column] = meta.loc[site, column]
-        task['input_complete'] = np.isfinite(task.select_dtypes('number')).all(axis=1)
-        frames.append(task)
-    return pd.concat(frames, ignore_index=True)
-
-
-def attach_labels(inputs, target_observations):
-    """Separate label table, component masks, including missing targets on input timeline."""
-    labels = target_observations[['site_id', 'time_utc', 'speed_mps', 'direction_deg', 'speed_valid', 'direction_valid']].rename(columns={'site_id': 'target_site_id'})
-    result = inputs[['target_site_id', 'time_utc']].merge(labels, on=['target_site_id', 'time_utc'], how='left', validate='one_to_one')
-    result['speed_mask'] = result.speed_valid.astype('boolean').fillna(False).astype(bool) & result.speed_mps.notna()
-    result['direction_mask'] = result.direction_valid.astype('boolean').fillna(False).astype(bool) & result.direction_deg.notna()
-    result['target_speed_mps'] = result.speed_mps.where(result.speed_mask)
-    radians = np.deg2rad(result.direction_deg.where(result.direction_mask))
-    result['target_direction_sin'], result['target_direction_cos'] = np.sin(radians), np.cos(radians)
-    return result[['target_site_id', 'time_utc', 'target_speed_mps', 'target_direction_sin', 'target_direction_cos', 'speed_mask', 'direction_mask']]
-
-
 def fit_scaler(training_inputs):
     """NaN-preserving scaler. Unknown metadata stays NaN and has an explicit mask."""
     columns = training_inputs.select_dtypes('number').columns.tolist()
@@ -598,44 +533,192 @@ def save_tables(folder, tables, csv=False):
             table.to_csv(folder / f'{name}.csv', index=False)
 
 
-def prepare_model_inputs(reference_wind, training_observations, validation_observations,
-                         era5, metadata, reference_site, train_sites, validation_sites,
-                         test_sites, start, end, fit_end_local, output):
-    """Optional data preparation only. Test observations are never accepted as inputs."""
-    groups = [set([reference_site]), set(train_sites), set(validation_sites), set(test_sites)]
-    if sum(map(len, groups)) != len(set.union(*groups)):
-        raise ValueError('Reference/train/validation/test sites must be disjoint.')
-    if not set(training_observations.site_id).issubset(train_sites):
-        raise ValueError('Unexpected training observation sites')
-    if not set(validation_observations.site_id).issubset(validation_sites):
-        raise ValueError('Unexpected validation observation sites')
-    output = Path(output)
-    tasks = {name: construct_pairs(reference_wind, era5, metadata, reference_site, sites, start, end)
-             for name, sites in [('train', train_sites), ('validation', validation_sites), ('test', test_sites)]}
-    labels = {'train': attach_labels(tasks['train'], training_observations),
-              'validation': attach_labels(tasks['validation'], validation_observations)}
-    local_day = (tasks['train'].time_utc.dt.tz_convert(TZ) - pd.Timedelta(hours=1)).dt.date
-    fitting = local_day.le(pd.Timestamp(fit_end_local).date())
-    if not fitting.any():
-        raise ValueError('No rows in the declared fitting window.')
-    scaler = fit_scaler(tasks['train'].loc[fitting])
-    save_tables(output / 'features', {'training_scaler': scaler.rename_axis('feature').reset_index()})
-    dynamic = ['reference_speed_mps', 'reference_direction_sin', 'reference_direction_cos',
-               *['reference_' + c for c in ERA_COLUMNS], *['target_' + c for c in ERA_COLUMNS]]
-    summaries = []
-    for name, inputs in tasks.items():
-        inputs['dynamic_inputs_available'] = np.isfinite(inputs[dynamic]).all(axis=1)
-        scaled, observed = apply_scaler(inputs, scaler)
-        keys = inputs[['target_site_id', 'reference_site_id', 'time_utc']].reset_index(drop=True)
-        save_tables(output / 'features', {
-            name + '_inputs': inputs,
-            name + '_scaled': pd.concat([keys, scaled.reset_index(drop=True)], axis=1),
-            name + '_feature_masks': pd.concat([keys, observed.add_suffix('_observed').reset_index(drop=True)], axis=1)})
-        summary = {'split': name, 'rows': len(inputs), 'dynamic_inputs_available': int(inputs.dynamic_inputs_available.sum())}
-        if name in labels:
-            summary['usable_speed_labels'] = int((inputs.dynamic_inputs_available & labels[name].speed_mask).sum())
-            summary['usable_direction_labels'] = int((inputs.dynamic_inputs_available & labels[name].direction_mask).sum())
-        summaries.append(summary)
-    save_tables(output / 'labels', {name + '_labels': table for name, table in labels.items()})
-    save_tables(output / 'features', {'training_time_split': tasks['train'][['target_site_id', 'time_utc']].assign(fit_window=fitting.to_numpy())})
-    return pd.DataFrame(summaries)
+def prepare_training_data(
+        wind_path='analyses_output_files/wind_pipeline/observations/wind.parquet',
+        era5_path='analyses_output_files/wind_pipeline/observations/era5.parquet',
+        metadata_path='analyses_output_files/wind_pipeline/metadata/metadata.parquet', *,
+        development_sites=('az06', 'az05', 'az22', 'az26'),
+        validation_sites=('az19',), test_sites=('az15',), fit_end_local='2015-12-31',
+        n_references=2, campaign_months=(3,), start=START, end=END,
+        metadata_columns=('latitude_deg', 'longitude_deg', 'ground_elevation_m')):
+    """Load cleaned tables ONCE; cache development-only, cutoff-limited hourly arrays.
+
+    No downloads, files written, combinations, or episode manifests. Pooled
+    development statistics are shared across reference slots and target variables.
+    Wind speed is standardized; direction sin/cos and cyclic time stay unchanged.
+    Entirely unobserved metadata columns are omitted in every slot.
+    """
+    sites, validation, test = list(development_sites), list(validation_sites), list(test_sites)
+    assigned = sites + validation + test
+    if len(assigned) != len(set(assigned)):
+        raise ValueError('Development/validation/test sites must be unique and disjoint.')
+    if not isinstance(n_references, (int, np.integer)) or not 1 <= n_references < len(sites):
+        raise ValueError('N_REFERENCES must be at least 1 and smaller than the development-site count.')
+    months = list(campaign_months)
+    if not months or len(months) != len(set(months)) or any(m not in (3, 6, 12) for m in months):
+        raise ValueError('Campaign lengths must be unique values from 3, 6, 12 months.')
+    metadata_columns = list(metadata_columns)
+    allowed = {'latitude_deg', 'longitude_deg', 'ground_elevation_m'}
+    if len(metadata_columns) != len(set(metadata_columns)) or not set(metadata_columns).issubset(allowed):
+        raise ValueError('Select unique coordinate/elevation metadata columns.')
+    first = pd.Timestamp(start).normalize().tz_localize(TZ)
+    cutoff = pd.Timestamp(fit_end_local).normalize().tz_localize(TZ) + pd.DateOffset(days=1)
+    last = min(pd.Timestamp(end).normalize().tz_localize(TZ) + pd.DateOffset(days=1), cutoff)
+    if last <= first:
+        raise ValueError('The training period must contain hours before the fitting cutoff.')
+    times = expected_hours(str(first.date()), str((last - pd.DateOffset(days=1)).date()))
+    filters = [('site_id', 'in', sites), ('time_utc', '>', first.tz_convert('UTC')),
+               ('time_utc', '<=', last.tz_convert('UTC'))]
+    wind = pd.read_parquet(wind_path, columns=['site_id', 'time_utc', 'speed_mps', 'direction_deg',
+                                              'speed_valid', 'direction_valid'], filters=filters)
+    era = pd.read_parquet(era5_path, columns=['site_id', 'time_utc', *ERA_COLUMNS], filters=filters)
+    metadata_path = Path(metadata_path)
+    meta = (pd.read_json(metadata_path) if metadata_path.suffix.lower() == '.json'
+            else pd.read_parquet(metadata_path))
+    meta = meta.loc[meta.site_id.isin(sites), ['site_id', *metadata_columns]]
+    if meta.site_id.duplicated().any() or set(meta.site_id) != set(sites):
+        raise ValueError('Require one metadata row for each development site.')
+    for name, table in [('wind', wind), ('ERA5', era)]:
+        if table.duplicated(['site_id', 'time_utc']).any():
+            raise ValueError(f'Duplicate cleaned {name} station/timestamp keys')
+    # Pool physical variables once, never by reference slot or held-out site.
+    wind.loc[~wind.speed_valid.astype('boolean').fillna(False) | wind.speed_mps.lt(0), 'speed_mps'] = np.nan
+    wind['speed_mps'] = wind.speed_mps.replace([np.inf, -np.inf], np.nan)
+    wind_stats = fit_scaler(wind[['speed_mps']])
+    era_stats = fit_scaler(era[ERA_COLUMNS].replace([np.inf, -np.inf], np.nan))
+    if wind_stats.n_observed.eq(0).any() or era_stats.n_observed.eq(0).any():
+        raise ValueError('Require observed development training speeds and all four ERA5 components.')
+    meta = meta.set_index('site_id').loc[sites].replace([np.inf, -np.inf], np.nan)
+    meta_stats = fit_scaler(meta)
+    excluded = meta_stats.index[meta_stats.n_observed.eq(0)].tolist()
+    meta_stats = meta_stats.loc[meta_stats.n_observed.gt(0)]
+    selected_metadata = meta_stats.index.tolist()
+
+    def normalize(frame, stats):
+        scaled, mask = apply_scaler(frame, stats)
+        values = scaled.where(mask, 0.).to_numpy(dtype=np.float32)
+        if not np.isfinite(values).all():
+            raise ValueError('Nonfinite normalized values; inspect the development training statistics.')
+        return values, mask.to_numpy(dtype=bool)
+
+    cache = {}
+    for site in sites:
+        w = wind.loc[wind.site_id.eq(site)].set_index('time_utc').reindex(times)
+        e = era.loc[era.site_id.eq(site)].set_index('time_utc').reindex(times)
+        speed, speed_mask = normalize(w[['speed_mps']], wind_stats)
+        direction_mask = (w.direction_valid.astype('boolean').fillna(False) & w.speed_mps.gt(0)
+                          & np.isfinite(w.direction_deg) & speed_mask[:, 0]).to_numpy(dtype=bool)
+        angle = np.deg2rad(w.direction_deg.where(direction_mask))
+        direction = np.column_stack([np.sin(angle), np.cos(angle)])
+        direction = np.where(direction_mask[:, None], direction, 0.).astype(np.float32)
+        wind_values = np.column_stack([speed, direction])
+        wind_mask = np.column_stack([speed_mask, direction_mask, direction_mask])
+        era_values, era_mask = normalize(e[ERA_COLUMNS], era_stats)
+        meta_values, meta_mask = normalize(meta.loc[[site]], meta_stats)
+        cache[site] = {'wind': wind_values, 'wind_mask': wind_mask,
+                       'era5': era_values, 'era5_mask': era_mask,
+                       'metadata': meta_values[0], 'metadata_mask': meta_mask[0],
+                       'essential': speed_mask[:, 0] & era_mask.all(axis=1)}
+    # Local interval midpoint for cyclic predictors.
+    local = times.tz_convert(TZ) - pd.Timedelta(minutes=30)
+    hour = (local.hour.to_numpy() + local.minute.to_numpy() / 60) / 24
+    doy = ((local.dayofyear.to_numpy() - 1) + hour) / np.where(local.is_leap_year, 366, 365)
+    cyclic = np.column_stack([np.sin(2 * np.pi * hour), np.cos(2 * np.pi * hour),
+                              np.sin(2 * np.pi * doy), np.cos(2 * np.pi * doy)]).astype(np.float32)
+    eligible_dates = {}
+    dates = pd.date_range(first, last - pd.DateOffset(days=1), freq='D')
+    for length in months:
+        eligible_dates[length] = dates[[d + pd.DateOffset(months=length) <= last for d in dates]]
+        if not len(eligible_dates[length]):
+            raise ValueError(f'No complete {length}-month campaign fits inside the training period.')
+    wind_names = ['speed_mps', 'direction_sin', 'direction_cos']
+    reference_variables = wind_names + ERA_COLUMNS + selected_metadata
+    feature_names = [f'reference_{slot}_{c}' for slot in range(1, n_references + 1) for c in reference_variables]
+    feature_names += ['target_' + c for c in ERA_COLUMNS + selected_metadata]
+    feature_names += ['local_hour_sin', 'local_hour_cos', 'local_doy_sin', 'local_doy_cos']
+    return {'sites': cache, 'development_sites': tuple(sites), 'validation_sites': tuple(validation),
+            'test_sites': tuple(test), 'n_references': n_references, 'campaign_months': tuple(months),
+            'eligible_campaign_dates': eligible_dates, 'times_utc': times.tz_localize(None).to_numpy(),
+            'cyclic': cyclic, 'feature_names': feature_names,
+            'target_names': ['target_speed_mps', 'target_direction_sin', 'target_direction_cos'],
+            'metadata_columns': selected_metadata, 'excluded_unobserved_metadata': excluded,
+            'normalization': {'wind_speed': wind_stats, 'era5': era_stats, 'metadata': meta_stats,
+                              'direction_sin_cos': 'unchanged; missing values zero with masks'},
+            'start_utc': first.tz_convert('UTC'), 'end_utc': last.tz_convert('UTC'),
+            'fit_end_utc': cutoff.tz_convert('UTC'),
+            'timestamp_convention': 'NumPy datetime64[ns] is UTC; campaign start < hourly endpoint <= end'}
+
+
+def sample_training_episode(data, rng, n_context=256, n_query=256, *,
+                            min_context_hours=24, min_context_fraction=0.5,
+                            min_query_hours=1, max_attempts=100):
+    """Sample a rotating target and simultaneous reference slots from prepared data.
+
+    Campaign validity is checked on ALL eligible campaign hours before subsampling.
+    Returned rows are sorted by UTC timestamp, without replacement or padding.
+    All choices use the caller's Generator; no validation/test observations enter.
+    """
+    if not isinstance(rng, np.random.Generator):
+        raise TypeError('rng must be a supplied numpy.random.Generator.')
+    counts = [n_context, n_query, min_context_hours, min_query_hours, max_attempts]
+    if any(not isinstance(n, (int, np.integer)) or n < 1 for n in counts) or not 0 <= min_context_fraction <= 1:
+        raise ValueError('Sample counts, minimum hours, and max_attempts must be positive integers; fraction must be in [0, 1].')
+    sites = data['development_sites']
+    times = data['times_utc']
+    last_reason = 'no candidate tried'
+    for _ in range(max_attempts):
+        target = str(rng.choice(sites))
+        references = tuple(str(s) for s in rng.choice([s for s in sites if s != target],
+                                                     size=data['n_references'], replace=False))
+        length = int(rng.choice(data['campaign_months']))
+        dates = data['eligible_campaign_dates'][length]
+        begin = dates[int(rng.integers(len(dates)))]
+        finish = begin + pd.DateOffset(months=length)
+        begin_utc, finish_utc = begin.tz_convert('UTC'), finish.tz_convert('UTC')
+        inside = (times > begin_utc.tz_localize(None).to_datetime64()) & (times <= finish_utc.tz_localize(None).to_datetime64())
+        target_data = data['sites'][target]
+        usable = target_data['wind_mask'][:, 0] & target_data['era5_mask'].all(axis=1)
+        for site in references:
+            usable = usable & data['sites'][site]['essential']
+        context_ids, query_ids = np.flatnonzero(inside & usable), np.flatnonzero(~inside & usable)
+        expected = int((finish_utc - begin_utc) / pd.Timedelta(hours=1))
+        if len(context_ids) < min_context_hours or len(context_ids) / expected < min_context_fraction:
+            last_reason = f'{target}: only {len(context_ids)}/{expected} usable campaign hours'
+            continue
+        if len(query_ids) < min_query_hours:
+            last_reason = f'{target}: only {len(query_ids)} usable outside-campaign hours'
+            continue
+        context_ids = np.sort(rng.choice(context_ids, size=min(n_context, len(context_ids)), replace=False))
+        query_ids = np.sort(rng.choice(query_ids, size=min(n_query, len(query_ids)), replace=False))
+
+        def assemble(ids):
+            values, masks = [], []
+            for site in references:
+                reference = data['sites'][site]
+                values.extend([reference['wind'][ids], reference['era5'][ids],
+                               np.broadcast_to(reference['metadata'], (len(ids), len(reference['metadata'])))])
+                masks.extend([reference['wind_mask'][ids], reference['era5_mask'][ids],
+                              np.broadcast_to(reference['metadata_mask'], (len(ids), len(reference['metadata_mask'])))])
+            values.extend([target_data['era5'][ids],
+                           np.broadcast_to(target_data['metadata'], (len(ids), len(target_data['metadata']))),
+                           data['cyclic'][ids]])
+            masks.extend([target_data['era5_mask'][ids],
+                          np.broadcast_to(target_data['metadata_mask'], (len(ids), len(target_data['metadata_mask']))),
+                          np.ones((len(ids), 4), dtype=bool)])
+            return (np.concatenate(values, axis=1), target_data['wind'][ids].copy(),
+                    np.concatenate(masks, axis=1), target_data['wind_mask'][ids].copy())
+
+        cx, cy, cx_mask, cy_mask = assemble(context_ids)
+        qx, qy, qx_mask, qy_mask = assemble(query_ids)
+        return {'context_x': cx, 'context_y': cy, 'query_x': qx, 'query_y': qy,
+                'context_x_mask': cx_mask, 'context_y_mask': cy_mask,
+                'query_x_mask': qx_mask, 'query_y_mask': qy_mask,
+                'target_site_id': target, 'reference_site_ids': references,
+                'campaign_months': length, 'campaign_start_utc': begin_utc, 'campaign_end_utc': finish_utc,
+                'context_times_utc': times[context_ids].copy(), 'query_times_utc': times[query_ids].copy(),
+                'usable_context_hours': int((inside & usable).sum()),
+                'feature_names': data['feature_names'], 'target_names': data['target_names']}
+    raise ValueError(f'Could not sample an adequate training episode after {max_attempts} attempts: {last_reason}. '
+                     'Check development coverage, campaign lengths, and context/query thresholds.')
+
+
