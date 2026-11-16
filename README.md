@@ -1,0 +1,2 @@
+# Transformer-Based-Measure-Correlate-Predict-MCP-Model
+Using a multihead attention transformer model trained custom in Pytorch, analyse wind resources based on a short campaign and extrapolate out to a longer time period. This was completed as a joint final project for MAE 579 (Wind Energy) and MAE 551 (Applied Machine Learning) as a part of my 4+1 Masters Degree in Mechanical Engineering at ASU.
