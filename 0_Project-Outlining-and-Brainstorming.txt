@@ -1,0 +1,48 @@
+Can a model trained across multiple sites reconstruct a new site’s long-term wind resource from a
+short measurement campaign, and does that improve turbine energy estimates over conventional MCP?
+
+PART 1: WIND ANALYSES SUITE
+    - this is will take the output from the finished neural network and make it legible/actionable
+    - Input: hourly speed and direction over reconstructed time frame + metadata
+        - metadata: site ID, measurement height, ML model used, start and end times (UTC)
+        - should accept either measured or reconstricted datasets for validation purposes
+    - Useful analyses:
+        - first just graph the inputs for some nice visual reference (don't use for any calcs)
+        - create historgram of wind speeds grouped by buckets
+        - apply different power curves across distribution
+        - calculate expected value of power at each
+            - make a PPA adjustable by the user
+        - make graphs comparing the EV in $ of different turbine models over time
+        - use this information to suggest a turbine
+        - make sure to siplay all of this clearly with graphs and tables and such
+
+PART 2: NEURAL NETWORK TRAINING
+    - ignore tempurature, pressure, humidity, they are not part of the scope
+    - the final, end goal of this algorithm looks like this:
+        - input from a "target" wind site (ex: 3 months of data)
+        - input from a "reference" wind site (10+ years of data)
+        - input from the "global" reference (Coppernicus, match reference site data)
+        - output 10+ years of data for "target" wind site
+    - This is the data available:
+        - "Target" and "Reference" hourly wind speed and direction (AZMet, 2005-2019)
+            - scalar/vector speed in m/s, direction in degrees, timestamps in UTC
+            - invalid values masked; gaps and coverage reports saved separately
+        - ERA5 @ "Target" and @ "Reference"
+            - hourly u/v wind components at 10m and 100m, matched by UTC timestamp
+        - Site metadata for "Target" and "Reference"
+            - coordinates, elevation, assumed 3m measurement height, ERA5 grid coordinates
+        - Site splits: az06 reference; az05/az22/az26 training; az19 validation; az15 testing
+            - cleaned tables saved as Parquet; model-input preparation is optional and off by default
+
+SPECIFIC DATASETS:
+    - AZMet 2005–2019:
+        - Maricopa        (az06), https://azmet.arizona.edu/azmet/06.htm
+        - Coolidge        (az05), https://azmet.arizona.edu/azmet/05.htm
+        - Queen Creek     (az22), https://azmet.arizona.edu/azmet/22.htm
+        - Buckeye         (az26), https://azmet.arizona.edu/azmet/26.htm
+        - Paloma          (az19), https://azmet.arizona.edu/azmet/19.htm
+        - Phoenix Encanto (az15), https://azmet.arizona.edu/azmet/15.htm
+    - ERA5 Hourly Time-Series Data: 
+        - https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels-timeseries?tab=overview
+
+
