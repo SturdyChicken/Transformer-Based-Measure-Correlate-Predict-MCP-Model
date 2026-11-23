@@ -1,4 +1,4 @@
-"""Wind-only loaders and leakage-safe feature preparation for notebook 1.
+"""Wind loaders, leakage-safe training preparation, and shared model inference.
 
 AZMet format: https://azmet.arizona.edu/azmet/raw2003.htm
 Missing values / intervals: https://azmet.arizona.edu/azmet/data.html
@@ -269,7 +269,7 @@ def documented_station_events(notes):
             if note.site_id == 'az22' and note.year == 2006 and 'replaced all' in text:
                 events.append(dict(site_id='az22', start_local='2006-01-01', end_local='2006-12-31',
                     kind='equipment_change_date_unknown', date_precision='year', source=note.source,
-                    description='Power faults and equipment/sensor replacement documented; exact change dates unresolved.'))
+                    description='Power faults and sensor replacement documented; exact dates unresolved, so exclude the entire year.'))
     return pd.DataFrame(events)
 
 
@@ -297,7 +297,8 @@ def clean_azmet(manifest, metadata, start=START, end=END, notes=None):
         if event['kind'] == 'substituted_wind':
             audit.loc[affected, 'substituted_from_other_site'] = True
             audit.loc[affected, 'estimated_observation'] = True
-        if event['kind'] in ('substituted_wind', 'hourly_outage'):
+        # Unknown replacement date: quarantine the entire documented year.
+        if event['kind'] in ('substituted_wind', 'hourly_outage', 'equipment_change_date_unknown'):
             audit.loc[affected, ['speed_valid', 'direction_valid', 'vector_speed_valid']] = False
             audit.loc[affected, ['speed_mps', 'direction_deg', 'vector_speed_mps']] = np.nan
     # All duplicate keys are quarantined, including identical duplicates; no arbitrary keep-first.
@@ -721,4 +722,300 @@ def sample_training_episode(data, rng, n_context=256, n_query=256, *,
     raise ValueError(f'Could not sample an adequate training episode after {max_attempts} attempts: {last_reason}. '
                      'Check development coverage, campaign lengths, and context/query thresholds.')
 
+
+
+
+# Shared inference definitions. Loading data in notebook 1 does not require PyTorch.
+def _build_context_model_class():
+    import torch
+    from torch import nn
+
+    class WindContextModel(nn.Module):
+        def __init__(self, n_features, n_targets, d_model, n_heads, d_ff,
+                     l_enc, l_dec, dropout, activation, layer_norm_eps):
+            super().__init__()
+            if n_heads < 1 or d_model % n_heads:
+                raise ValueError("D_MODEL must be divisible by N_HEADS.")
+            if n_targets != 3 or activation != 'gelu' or min(l_enc, l_dec) < 1:
+                raise ValueError("Require three wind outputs, GELU, and positive layer counts.")
+            self.head_width = d_model // n_heads
+            # 1. Projection input widths: 2F+6 and 2F.
+            self.context_projection = nn.Linear(2*n_features + 2*n_targets, d_model)
+            self.query_projection = nn.Linear(2*n_features, d_model)
+
+            def layer():
+                return nn.ModuleDict({
+                    'attention': nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
+                    'attention_dropout': nn.Dropout(dropout),
+                    'norm1': nn.LayerNorm(d_model, eps=layer_norm_eps),
+                    'ff': nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_ff, d_model)),
+                    'ff_dropout': nn.Dropout(dropout),
+                    'norm2': nn.LayerNorm(d_model, eps=layer_norm_eps)})
+            self.encoder = nn.ModuleList([layer() for _ in range(l_enc)])
+            self.decoder = nn.ModuleList([layer() for _ in range(l_dec)])
+            self.output_head = nn.Linear(d_model, n_targets)
+
+        def encode_context(self, context_x, context_x_mask, context_y, context_y_mask):
+            # 1. Observed masks are part of the embedding input.
+            h = self.context_projection(torch.cat((context_x, context_x_mask.to(context_x.dtype),
+                                                  context_y, context_y_mask.to(context_y.dtype)), dim=-1))
+            # 2. Separately parameterized context self-attention layers.
+            for layer in self.encoder:
+                attended, _ = layer['attention'](h, h, h, need_weights=False)
+                z = layer['norm1'](h + layer['attention_dropout'](attended))
+                h = layer['norm2'](z + layer['ff_dropout'](layer['ff'](z)))
+            return h
+
+        def predict_queries(self, encoded_context, query_x, query_x_mask):
+            h = self.query_projection(torch.cat((query_x, query_x_mask.to(query_x.dtype)), dim=-1))
+            # 3. Cross-attention to the final context encoding, with no query self-attention.
+            for layer in self.decoder:
+                attended, _ = layer['attention'](h, encoded_context, encoded_context, need_weights=False)
+                z = layer['norm1'](h + layer['attention_dropout'](attended))
+                h = layer['norm2'](z + layer['ff_dropout'](layer['ff'](z)))
+            # 4. Unconstrained [1,Q,len(target_names)] predictions.
+            return self.output_head(h)
+
+        def forward(self, context_x, context_x_mask, context_y, context_y_mask, query_x, query_x_mask):
+            encoded = self.encode_context(context_x, context_x_mask, context_y, context_y_mask)
+            return self.predict_queries(encoded, query_x, query_x_mask)
+
+    WindContextModel.__qualname__ = 'WindContextModel'
+    return WindContextModel
+
+
+def __getattr__(name):
+    # Load the attention class only when a training/inference notebook requests it.
+    if name == 'WindContextModel':
+        if name not in globals():
+            globals()[name] = _build_context_model_class()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def plain_normalization(normalization):
+    # Preserve statistic dtypes as plain strings to reproduce float32 preprocessing.
+    return {k: {'values': v.to_dict(orient='index'), 'dtypes': v.dtypes.astype(str).to_dict()}
+            if isinstance(v, pd.DataFrame) else v for k, v in normalization.items()}
+
+
+def restore_normalization(normalization):
+    return {k: pd.DataFrame.from_dict(v['values'], orient='index').reindex(columns=list(v['dtypes'])).astype(v['dtypes'])
+            if k in ('wind_speed', 'era5', 'metadata') and not isinstance(v, pd.DataFrame) else v
+            for k, v in normalization.items()}
+
+
+def load_aligned_sites(wind_path, era5_path, metadata_path, site_ids, start_local, end_local,
+                       normalization, metadata_columns, local_timezone, wind_windows=None):
+    """Read selected sites once and apply saved normalization without fitting.
+
+    Optional wind_windows maps every site to (start_utc, end_utc), with
+    start < endpoint <= end. Target campaign-only reads prevent label leakage.
+    """
+    site_ids = tuple(site_ids)
+    first = pd.Timestamp(start_local).normalize().tz_localize(local_timezone)
+    last = pd.Timestamp(end_local).normalize().tz_localize(local_timezone) + pd.DateOffset(days=1)
+    if last <= first or len(set(site_ids)) != len(site_ids):
+        raise ValueError("Require distinct sites and a positive date range.")
+    times = pd.date_range(first + pd.Timedelta(hours=1), last, freq='h').tz_convert('UTC')
+    base_filters = [('site_id', 'in', list(site_ids)), ('time_utc', '>', first.tz_convert('UTC')),
+                    ('time_utc', '<=', last.tz_convert('UTC'))]
+    if wind_windows is None:
+        wind_filters = base_filters
+    else:
+        if set(wind_windows) != set(site_ids):
+            raise ValueError("Supply wind read bounds for every selected site.")
+        wind_filters = [[('site_id', '==', s),
+                         ('time_utc', '>', max(pd.Timestamp(wind_windows[s][0]), first.tz_convert('UTC'))),
+                         ('time_utc', '<=', min(pd.Timestamp(wind_windows[s][1]), last.tz_convert('UTC')))]
+                        for s in site_ids]
+    wind = pd.read_parquet(wind_path, columns=['site_id', 'time_utc', 'speed_mps', 'direction_deg',
+                                              'speed_valid', 'direction_valid'], filters=wind_filters)
+    era = pd.read_parquet(era5_path, columns=['site_id', 'time_utc', *ERA_COLUMNS], filters=base_filters)
+    # Height is read only for output provenance; normalize/assemble retained predictors only.
+    columns = list(dict.fromkeys(['site_id', *metadata_columns, 'measurement_height_m']))
+    meta = pd.read_parquet(metadata_path, columns=columns, filters=[('site_id', 'in', list(site_ids))])
+    if meta.site_id.duplicated().any() or set(meta.site_id) != set(site_ids):
+        raise ValueError("Require one metadata row per selected site.")
+    for name, table in [('wind', wind), ('ERA5', era)]:
+        if table.duplicated(['site_id', 'time_utc']).any():
+            raise ValueError(f"Duplicate cleaned {name} site/timestamp keys.")
+    meta = meta.set_index('site_id')
+    stats = restore_normalization(normalization)
+    if list(stats['metadata'].index) != list(metadata_columns):
+        raise ValueError("Retained metadata must match saved column order.")
+    wind.loc[~wind.speed_valid.astype('boolean').fillna(False) | wind.speed_mps.lt(0), 'speed_mps'] = np.nan
+    wind['speed_mps'] = wind.speed_mps.replace([np.inf, -np.inf], np.nan)
+
+    def normalize(frame, scaler):
+        scaled, mask = apply_scaler(frame, scaler)
+        values = scaled.where(mask, 0.).to_numpy(dtype=np.float32)
+        if not np.isfinite(values).all():
+            raise ValueError("Nonfinite normalized values; inspect saved training statistics.")
+        return values, mask.to_numpy(dtype=bool)
+
+    cache = {}
+    for site in site_ids:
+        w = wind.loc[wind.site_id.eq(site)].set_index('time_utc').reindex(times)
+        e = era.loc[era.site_id.eq(site)].set_index('time_utc').reindex(times)
+        speed, speed_mask = normalize(w[['speed_mps']], stats['wind_speed'])
+        dm = (w.direction_valid.astype('boolean').fillna(False) & w.speed_mps.gt(0)
+              & np.isfinite(w.direction_deg) & speed_mask[:, 0]).to_numpy(dtype=bool)
+        angle = np.deg2rad(w.direction_deg.where(dm))
+        direction = np.where(dm[:, None], np.column_stack([np.sin(angle), np.cos(angle)]), 0.).astype(np.float32)
+        era_values, era_mask = normalize(e[ERA_COLUMNS], stats['era5'])
+        metadata_values, metadata_mask = normalize(meta.loc[[site], list(metadata_columns)], stats['metadata'])
+        cache[site] = dict(wind=np.column_stack([speed, direction]),
+                           wind_mask=np.column_stack([speed_mask, dm, dm]),
+                           era5=era_values, era5_mask=era_mask,
+                           metadata=metadata_values[0], metadata_mask=metadata_mask[0],
+                           essential=speed_mask[:, 0] & era_mask.all(axis=1))
+    local = times.tz_convert(local_timezone) - pd.Timedelta(minutes=30)
+    hour = (local.hour.to_numpy() + local.minute.to_numpy()/60) / 24
+    doy = ((local.dayofyear.to_numpy()-1) + hour) / np.where(local.is_leap_year, 366, 365)
+    cyclic = np.column_stack([np.sin(2*np.pi*hour), np.cos(2*np.pi*hour),
+                              np.sin(2*np.pi*doy), np.cos(2*np.pi*doy)]).astype(np.float32)
+    return dict(sites=cache, times_utc=times.tz_localize(None).to_numpy(), cyclic=cyclic,
+                measurement_heights_m={s: float(meta.loc[s, 'measurement_height_m']) for s in site_ids})
+
+
+def assemble_predictors(data, target, references, ids, feature_names, metadata_columns):
+    """Reference sequence defines slot order. Target measured wind never enters X."""
+    values, masks, names = [], [], []
+    metadata_columns = list(metadata_columns)
+    for slot, site in enumerate(references, start=1):
+        ref = data['sites'][site]
+        values.extend([ref['wind'][ids], ref['era5'][ids], np.broadcast_to(ref['metadata'], (len(ids), len(metadata_columns)))])
+        masks.extend([ref['wind_mask'][ids], ref['era5_mask'][ids], np.broadcast_to(ref['metadata_mask'], (len(ids), len(metadata_columns)))])
+        names.extend([f'reference_{slot}_{c}' for c in ['speed_mps', 'direction_sin', 'direction_cos', *ERA_COLUMNS, *metadata_columns]])
+    tar = data['sites'][target]
+    values.extend([tar['era5'][ids], np.broadcast_to(tar['metadata'], (len(ids), len(metadata_columns))), data['cyclic'][ids]])
+    masks.extend([tar['era5_mask'][ids], np.broadcast_to(tar['metadata_mask'], (len(ids), len(metadata_columns))), np.ones((len(ids), 4), dtype=bool)])
+    names.extend(['target_' + c for c in [*ERA_COLUMNS, *metadata_columns]])
+    names.extend(['local_hour_sin', 'local_hour_cos', 'local_doy_sin', 'local_doy_cos'])
+    if names != list(feature_names):
+        raise ValueError("Feature order differs from the trained model.")
+    return np.concatenate(values, axis=1), np.concatenate(masks, axis=1)
+
+
+def campaign_indices(data, target, references, begin, finish, min_context_hours, min_context_fraction):
+    times = pd.to_datetime(data['times_utc'], utc=True)
+    if begin < times[0]-pd.Timedelta(hours=1) or finish > times[-1] or finish <= begin:
+        raise ValueError(f"Campaign {begin} to {finish} lies outside the available period.")
+    inside = np.asarray((times > begin) & (times <= finish))
+    tar = data['sites'][target]
+    usable = tar['wind_mask'][:, 0] & tar['era5_mask'].all(axis=1)
+    for ref in references:
+        usable = usable & data['sites'][ref]['essential']
+    ci = np.flatnonzero(inside & usable)
+    expected = int((finish-begin)/pd.Timedelta(hours=1))
+    if len(ci) < min_context_hours or len(ci)/expected < min_context_fraction:
+        raise ValueError(f"{target}: campaign {begin} to {finish} has only {len(ci)}/{expected} usable hours.")
+    return ci, np.flatnonzero(~inside & usable)
+
+
+def load_checkpoint(path, device):
+    import torch
+    from wind_pipeline import WindContextModel
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    loaded_model = WindContextModel(**checkpoint['architecture']).to(device)
+    loaded_model.load_state_dict(checkpoint['model_state_dict'])
+    loaded_model.eval()
+    return loaded_model, checkpoint, restore_normalization(checkpoint['normalization'])
+
+
+def assemble_reconstruction_inputs(wind_path, era5_path, metadata_path, saved, normalization,
+                                   target, references, campaign_start_local, campaign_months,
+                                   start_local, end_local, context_mode="full", rng=None):
+    settings = saved['preprocessing']
+    references = tuple(references)
+    if context_mode not in ('trained', 'full'):
+        raise ValueError("context_mode must be 'trained' or 'full'.")
+    if context_mode == 'trained' and not isinstance(rng, np.random.Generator):
+        raise TypeError("Supply a separate NumPy Generator for trained-count context selection.")
+    if len(references) != settings['n_references'] or len(set(references)) != len(references):
+        raise ValueError("Require the configured number of distinct references in explicit slot order.")
+    if target in references or not set(references).issubset(saved['site_roles']['development_sites']):
+        raise ValueError("References must be development sites distinct from the target.")
+    timezone = settings['local_timezone']
+    begin = pd.Timestamp(campaign_start_local).normalize().tz_localize(timezone)
+    finish = begin + pd.DateOffset(months=campaign_months)
+    begin, finish = begin.tz_convert('UTC'), finish.tz_convert('UTC')
+    period_start = pd.Timestamp(start_local).normalize().tz_localize(timezone).tz_convert('UTC')
+    period_end = (pd.Timestamp(end_local).normalize().tz_localize(timezone)+pd.DateOffset(days=1)).tz_convert('UTC')
+    windows = {s: (period_start, period_end) for s in references}
+    windows[target] = (begin, finish)
+    data = load_aligned_sites(wind_path, era5_path, metadata_path, [target, *references],
+                              start_local, end_local, normalization, saved['metadata_columns'], timezone, windows)
+    ci, _ = campaign_indices(data, target, references, begin, finish,
+                              settings['min_context_hours'], settings['min_context_fraction'])
+    usable_context_hours = len(ci)
+    if context_mode == 'trained':
+        trained_count = settings['n_context']
+        if not isinstance(trained_count, (int, np.integer)) or trained_count < 1:
+            raise ValueError("The checkpoint must contain a positive training n_context.")
+        ci = np.sort(rng.choice(ci, size=min(trained_count, len(ci)), replace=False))
+    qi = np.arange(len(data['times_utc']))  # Every requested hour, including missing predictors.
+    cx, cm = assemble_predictors(data, target, references, ci, saved['feature_names'], saved['metadata_columns'])
+    qx, qm = assemble_predictors(data, target, references, qi, saved['feature_names'], saved['metadata_columns'])
+    tar = data['sites'][target]
+    details = dict(target_site_id=target, reference_site_ids=list(references),
+                   measurement_height_m=data['measurement_heights_m'][target],
+                   campaign_start_utc=begin.isoformat(), campaign_end_utc=finish.isoformat(),
+                   reconstruction_start_utc=pd.Timestamp(data['times_utc'][0], tz='UTC').isoformat(),
+                   reconstruction_end_utc=pd.Timestamp(data['times_utc'][-1], tz='UTC').isoformat(),
+                   model_identity=saved['model_identity'], context_mode=context_mode,
+                   usable_context_hours=usable_context_hours, context_hours_used=len(ci))
+    arrays = dict(context_x=cx, context_x_mask=cm, context_y=tar['wind'][ci].copy(),
+                  context_y_mask=tar['wind_mask'][ci].copy(), query_x=qx, query_x_mask=qm,
+                  query_times_utc=pd.to_datetime(data['times_utc'], utc=True))
+    return arrays, details
+
+
+def reconstruct_wind(model, context_x, context_x_mask, context_y, context_y_mask,
+                     query_x, query_x_mask, query_times_utc, normalization, device,
+                     query_chunk_size, reconstruction_metadata, calm_speed_mps, direction_vector_eps):
+    """Unbatched arrays [C,F]/[C,3]/[Q,F]. No query labels are required."""
+    import torch
+    if not isinstance(query_chunk_size, int) or query_chunk_size < 1:
+        raise ValueError("Query chunk size must be a positive integer.")
+    times = pd.to_datetime(query_times_utc, utc=True)
+    if len(times) != len(query_x) or len(times) == 0 or times.isna().any():
+        raise ValueError("Require one valid UTC timestamp per query row.")
+    for values, mask in [(context_x, context_x_mask), (context_y, context_y_mask), (query_x, query_x_mask)]:
+        if values.ndim != 2 or values.shape != mask.shape:
+            raise ValueError("Values and masks must be matching two-dimensional arrays.")
+    if len(context_x) == 0 or len(context_x) != len(context_y) or not context_y_mask[:, 0].all():
+        raise ValueError("Supply nonempty context rows with observed speed supervision.")
+
+    def tensor(array, mask=False):
+        return torch.as_tensor(array, device=device, dtype=torch.bool if mask else torch.float32).unsqueeze(0)
+
+    was_training = model.training
+    model.eval()
+    outputs = []
+    try:
+        with torch.no_grad():
+            encoded = model.encode_context(tensor(context_x), tensor(context_x_mask, True),
+                                           tensor(context_y), tensor(context_y_mask, True))
+            for first in range(0, len(query_x), query_chunk_size):
+                last = first+query_chunk_size
+                prediction = model.predict_queries(encoded, tensor(query_x[first:last]), tensor(query_x_mask[first:last], True))
+                outputs.append(prediction.squeeze(0).cpu().numpy())
+    finally:
+        model.train(was_training)
+    prediction = np.concatenate(outputs, axis=0)
+    if not np.isfinite(prediction).all():
+        raise FloatingPointError("Nonfinite reconstruction predictions.")
+    stats = restore_normalization(normalization)['wind_speed'].loc['speed_mps']
+    speed = np.maximum(0., prediction[:, 0].astype(np.float64)*stats['std']+stats['mean'])
+    direction = np.degrees(np.arctan2(prediction[:, 1].astype(np.float64), prediction[:, 2].astype(np.float64))) % 360
+    direction[(speed <= calm_speed_mps) | (np.hypot(prediction[:, 1], prediction[:, 2]) <= direction_vector_eps)] = np.nan
+    # Conservative per-query completeness; never consult target observations.
+    predictors_complete = np.asarray(query_x_mask, dtype=bool).all(axis=1)
+    result = pd.DataFrame(dict(time_utc=times, predicted_speed_mps=speed,
+                               predicted_direction_deg=direction, predictors_complete=predictors_complete))
+    metadata = dict(reconstruction_metadata)
+    metadata.update(reconstruction_start_utc=times.min().isoformat(), reconstruction_end_utc=times.max().isoformat())
+    return result, metadata
 
